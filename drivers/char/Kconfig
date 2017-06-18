@@ -588,6 +588,12 @@ config TILE_SROM
 	  device appear much like a simple EEPROM, and knows
 	  how to partition a single ROM for multiple purposes.
 
+config OPTIMSOC_NOC
+	bool "OpTiMSoC NoC Driver"
+	default "y"
+	---help---
+		OpTiMSoC NoC Driver
+
 source "drivers/char/xillybus/Kconfig"
 
 endmenu
