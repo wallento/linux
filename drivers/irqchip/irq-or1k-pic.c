@@ -70,7 +70,8 @@ static struct or1k_pic_dev or1k_pic_level = {
 		.name = "or1k-PIC-level",
 		.irq_unmask = or1k_pic_unmask,
 		.irq_mask = or1k_pic_mask,
-		.irq_mask_ack = or1k_pic_mask,
+		.irq_ack = or1k_pic_ack,
+		.irq_mask_ack = or1k_pic_mask_ack,
 	},
 	.handle = handle_level_irq,
 	.flags = IRQ_LEVEL | IRQ_NOPROBE,
@@ -168,6 +169,7 @@ IRQCHIP_DECLARE(or1k_pic, "opencores,or1k-pic", or1k_pic_or1200_init);
 static int __init or1k_pic_level_init(struct device_node *node,
 				      struct device_node *parent)
 {
+
 	return or1k_pic_init(node, &or1k_pic_level);
 }
 IRQCHIP_DECLARE(or1k_pic_level, "opencores,or1k-pic-level",
@@ -176,6 +178,7 @@ IRQCHIP_DECLARE(or1k_pic_level, "opencores,or1k-pic-level",
 static int __init or1k_pic_edge_init(struct device_node *node,
 				     struct device_node *parent)
 {
+
 	return or1k_pic_init(node, &or1k_pic_edge);
 }
 IRQCHIP_DECLARE(or1k_pic_edge, "opencores,or1k-pic-edge", or1k_pic_edge_init);
