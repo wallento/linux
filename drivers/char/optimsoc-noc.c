@@ -35,6 +35,8 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 
+#define NR_ENDPOINTS 16
+
 /*
  * Device name.
  */
@@ -60,18 +62,6 @@ static uint32_t OPTIMSOC_NA_BASE_VADDR = 0;
  */
 #define OPTIMSOC_NA_MEM_SIZE 4096
 
-#define OPTIMSOC_NA_REGS       (OPTIMSOC_NA_BASE_VADDR + 0x00000)
-#define OPTIMSOC_NA_TILEID     (OPTIMSOC_NA_REGS       + 0x0)
-#define OPTIMSOC_NA_NUMTILES   (OPTIMSOC_NA_REGS       + 0x4)
-#define OPTIMSOC_NA_COREBASE   (OPTIMSOC_NA_REGS       + 0x10)
-#define OPTIMSOC_NA_TOTALCORES (OPTIMSOC_NA_REGS       + 0x18)
-#define OPTIMSOC_NA_GMEM_SIZE  (OPTIMSOC_NA_REGS       + 0x1c)
-#define OPTIMSOC_NA_GMEM_TILE  (OPTIMSOC_NA_REGS       + 0x20)
-#define OPTIMSOC_NA_LMEM_SIZE  (OPTIMSOC_NA_REGS       + 0x24)
-#define OPTIMSOC_NA_CT_NUM     (OPTIMSOC_NA_REGS       + 0x28)
-#define OPTIMSOC_NA_SEED       (OPTIMSOC_NA_REGS       + 0x2c)
-#define OPTIMSOC_NA_CT_LIST    (OPTIMSOC_NA_REGS       + 0x200)
-
 #define BASE       (OPTIMSOC_NA_BASE_VADDR + 0x100000)
 #define REG_NUMEP  BASE
 #define EP_BASE    BASE + 0x2000
@@ -84,14 +74,6 @@ static uint32_t OPTIMSOC_NA_BASE_VADDR = 0;
  * Maximum packet size (in words).
  */
 #define OPTIMSOC_NA_MAX_PACKET_SIZE 32
-
-#define OPTIMSOC_DEST_MSB 31
-#define OPTIMSOC_DEST_LSB 27
-#define OPTIMSOC_CLASS_MSB 26
-#define OPTIMSOC_CLASS_LSB 24
-#define OPTIMSOC_CLASS_NUM 8
-#define OPTIMSOC_SRC_MSB 23
-#define OPTIMSOC_SRC_LSB 19
 
 /*
  * Success.
@@ -109,41 +91,16 @@ static uint32_t OPTIMSOC_NA_BASE_VADDR = 0;
 static int major;
 
 /*
- * Number of threads using the device. 
- */
-static int nopen = 0;
-
-/*
- * Buffers.
- */
-static uint32_t *_buffer;
-
-static volatile uint32_t *_domains_ready;
-
-/*
- * Class handlers.
- */
-void (*cls_handlers[OPTIMSOC_CLASS_NUM])(uint32_t*,size_t);
-
-/*
  * Number of end points.
  */
 static uint32_t _num_endpoints;
 
-#define EXTRACT(x,msb,lsb) ((x>>lsb) & ~(~0 << (msb-lsb+1)))
-#define SET(x,v,msb,lsb) (((~0 << ((msb)+1) | ~(~0 << (lsb)))&x) | \
-		(((v) & ~(~0<<((msb)-(lsb)+1))) << (lsb)))
+static struct
+{
+	int nopen;        /* Number of processes using this device. */
+	uint32_t *buffer; /* Input buffer.                          */
+} adapters[NR_ENDPOINTS];
 
-int optimsoc_get_tilerank(unsigned int tile) {
-	int i;
-    uint16_t *ctlist = (uint16_t*) OPTIMSOC_NA_CT_LIST;
-    for (i = 0; i < OPTIMSOC_NA_CT_NUM; i++) {
-        if (ctlist[i] == tile) {
-            return i;
-        }
-    }
-    return -1;
-}
 
 /*
  * Sends a word.
@@ -183,9 +140,6 @@ static irqreturn_t irq_handler(int irq, void *opaque)
         for (ep = 0; ep < _num_endpoints; ep++)
 		{
 			/* Get message size. */
-            uint32_t header;
-            uint8_t class;
-			uint32_t src;
             size_t size = receive(ep);
 
 			/* There are no further messages in the buffer. */
@@ -206,37 +160,8 @@ static irqreturn_t irq_handler(int irq, void *opaque)
 			else
 			{
                 for (i = 0; i < size; i++)
-                    _buffer[i] = receive(ep);
+                    adapters[ep].buffer[i] = receive(ep);
             }
-
-            header = _buffer[0];
-			
-            /** Extract class. */
-            class = EXTRACT(header, OPTIMSOC_CLASS_MSB, OPTIMSOC_CLASS_LSB);
-            if (class == OPTIMSOC_CLASS_NUM-1)
-			{
-                uint32_t ready = (header & 0x2) >> 1;
-                if (ready)
-				{
-                    uint32_t tile, domain;
-                    uint8_t endpoint;
-                    tile = EXTRACT(header, OPTIMSOC_SRC_MSB, OPTIMSOC_SRC_LSB);
-                    domain = optimsoc_get_tilerank(tile);
-                    endpoint = EXTRACT(header, 9, 2);
-                    _domains_ready[domain] |= 1 << endpoint;
-                }
-            }
-
-            // Call respective class handler
-            if (cls_handlers[class] == 0) {
-				printk(KERN_ALERT "%s: dropping packet of unknown class %d", OPTIMSOC_NA_NAME, class);
-                continue;
-            }
-
-            src = (_buffer[0]>>OPTIMSOC_SRC_LSB) & 0x1f;
-
-            cls_handlers[class](_buffer,size);
-
         }
 
         if (empty == _num_endpoints)
@@ -260,13 +185,18 @@ void optimsoc_mp_simple_send(uint16_t endpoint, size_t size, uint32_t *buf)
  */
 static int device_open(struct inode *inode, struct file *file)
 {
+	unsigned minor;
+
+	minor = iminor(inode);
+
 	/* Device already in use. */
-	if (nopen > 0)
+	if (adapters[minor].nopen > 0)
 		return (-EBUSY);
 
-	OPTIMSOC_NA_BASE_VADDR = (uint32_t) ioremap_nocache(OPTIMSOC_NA_BASE_HWADDR, OPTIMSOC_NA_MEM_SIZE);
+	/* Allocate buffer. */
+    adapters[minor].buffer = kmalloc(OPTIMSOC_NA_MAX_PACKET_SIZE*sizeof(uint32_t), GFP_KERNEL);
 
-	nopen++;
+	adapters[minor].nopen++;
 	try_module_get(THIS_MODULE);
 
 	return (SUCCESS);
@@ -277,7 +207,11 @@ static int device_open(struct inode *inode, struct file *file)
  */
 static int device_release(struct inode *inode, struct file *file)
 {
-	nopen--;
+	unsigned minor;
+
+	minor = iminor(inode);
+
+	adapters[minor].nopen--;
 	module_put(THIS_MODULE);
 
 	return (SUCCESS);
@@ -288,6 +222,10 @@ static int device_release(struct inode *inode, struct file *file)
  */
 static ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_t * offset)
 {
+
+	unsigned minor;
+
+	minor = iminor(filp->f_inode);
 
 	return (0);
 }
@@ -332,16 +270,16 @@ static int __init optimsoc_module_init(void)
 	if (ret != SUCCESS)
 		goto error1;
 
-    /* Reset class handlers. */
-    for (i = 0; i <OPTIMSOC_CLASS_NUM; i++) {
-        cls_handlers[i] = NULL;
-    }
+	OPTIMSOC_NA_BASE_VADDR = (uint32_t) ioremap_nocache(OPTIMSOC_NA_BASE_HWADDR, OPTIMSOC_NA_MEM_SIZE);
 
     _num_endpoints = (uint32_t)(REG_NUMEP);
-    _domains_ready = kmalloc(OPTIMSOC_NA_CT_NUM*sizeof(uint32_t), GFP_KERNEL);
 
-	/* Allocate buffer. */
-    _buffer = kmalloc(OPTIMSOC_NA_MAX_PACKET_SIZE*sizeof(uint32_t), GFP_KERNEL);
+	/* Initialize devices. */
+	for (i = 0; i < NR_ENDPOINTS; i++)
+	{
+		adapters[i].nopen = 0;
+		adapters[i].buffer = NULL;
+	}
 
 	return (SUCCESS);
 
