@@ -29,10 +29,12 @@
  */
 
 #include <asm/io.h>
+#include <asm/uaccess.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 
 #define NR_ENDPOINTS 16
@@ -40,7 +42,7 @@
 /*
  * Device name.
  */
-#define OPTIMSOC_NA_NAME "noc"
+#define OPTIMSOC_NA_NAME "optimsoc-noc"
 
 /*
  * NoC adapter IRQ number.
@@ -60,7 +62,7 @@ static uint32_t OPTIMSOC_NA_BASE_VADDR = 0;
 /*
  * NoC adapter memory size.
  */
-#define OPTIMSOC_NA_MEM_SIZE 4096
+#define OPTIMSOC_NA_MEM_SIZE (8*1024*1024)
 
 #define BASE       (OPTIMSOC_NA_BASE_VADDR + 0x100000)
 #define REG_NUMEP  BASE
@@ -70,10 +72,15 @@ static uint32_t OPTIMSOC_NA_BASE_VADDR = 0;
 #define REG_RECV   0x0
 #define REG_ENABLE 0x4
 
-/*
- * Maximum packet size (in words).
+/**
+ * Retrieves a word at a target address.
  */
-#define OPTIMSOC_NA_MAX_PACKET_SIZE 32
+#define REG32(x) (*((uint32_t *)(x)))
+
+/*
+ * Buffer size (in bytes).
+ */
+#define OPTIMSOC_NA_BUFFER_SIZE 32
 
 /*
  * Success.
@@ -93,12 +100,16 @@ static int major;
 /*
  * Number of end points.
  */
-static uint32_t _num_endpoints;
+static uint32_t nr_endpoints;
 
 static struct
 {
-	int nopen;        /* Number of processes using this device. */
-	uint32_t *buffer; /* Input buffer.                          */
+	int nopen;                /* Number of processes using this device. */
+	int head;                 /* Buffer head.                           */
+	int tail;                 /* Buffer tail.                           */
+	int data_received;        /* Was any data received?                 */
+	uint32_t *buffer;         /* Input buffer.                          */
+	wait_queue_head_t wqueue; /* Wait queue of processes.               */
 } adapters[NR_ENDPOINTS];
 
 
@@ -132,52 +143,35 @@ static uint32_t receive(unsigned ep)
  */
 static irqreturn_t irq_handler(int irq, void *opaque)
 {
-    while (1)
-	{
-		int i;
-        uint16_t empty = 0;
-		uint16_t ep;
-        for (ep = 0; ep < _num_endpoints; ep++)
-		{
-			/* Get message size. */
-            size_t size = receive(ep);
-
-			/* There are no further messages in the buffer. */
-            if (size==0)
-			{
-                empty++;
-                continue;
-            } 
-
-			/* Message too long. */
-			else if (size > OPTIMSOC_NA_MAX_PACKET_SIZE)
-			{
-				/* Drop packets. */
-                for (i = 0; i < size; i++)
-                    (void)receive(ep);
-            }
-			/* Copy message content to buffer. */
-			else
-			{
-                for (i = 0; i < size; i++)
-                    adapters[ep].buffer[i] = receive(ep);
-            }
-        }
-
-        if (empty == _num_endpoints)
-            break;
-    }
-
-	return (IRQ_HANDLED);
-}
-
-void optimsoc_mp_simple_send(uint16_t endpoint, size_t size, uint32_t *buf)
-{
 	int i;
 
-	send(endpoint, size);
-    for (i = 0; i < size; i++)
-		send(endpoint, buf[i]);
+	((void) opaque);
+
+	for (i = 0; i < nr_endpoints; i++)
+	{
+		uint32_t word;
+
+		/*
+		 * FIXME: Potential race condition bellow.
+		 */
+		if (adapters[i].nopen <= 0)
+			continue;
+
+		word = receive(i);
+
+		/* Drop packet. */
+		if ((adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE == adapters[i].head)
+			continue;
+		
+		adapters[i].buffer[adapters[i].tail] = word;
+
+		adapters[i].tail = (adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE;
+
+		adapters[i].data_received = 1;
+		wake_up(adapters[i].wqueue);
+	}
+
+	return (IRQ_HANDLED);
 }
 
 /*
@@ -189,14 +183,19 @@ static int device_open(struct inode *inode, struct file *file)
 
 	minor = iminor(inode);
 
+	printk(KERN_INFO "%s: open device %d", OPTIMSOC_NA_NAME, minor);
+
 	/* Device already in use. */
 	if (adapters[minor].nopen > 0)
 		return (-EBUSY);
 
-	/* Allocate buffer. */
-    adapters[minor].buffer = kmalloc(OPTIMSOC_NA_MAX_PACKET_SIZE*sizeof(uint32_t), GFP_KERNEL);
+	/* Grab resources. */
+    adapters[minor].buffer = kmalloc(OPTIMSOC_NA_BUFFER_SIZE, GFP_KERNEL);
+	if (adapters[minor].buffer == NULL)
+		return (-ENOMEM);
 
 	adapters[minor].nopen++;
+
 	try_module_get(THIS_MODULE);
 
 	return (SUCCESS);
@@ -211,7 +210,11 @@ static int device_release(struct inode *inode, struct file *file)
 
 	minor = iminor(inode);
 
+	/* Release resources. */
 	adapters[minor].nopen--;
+	kfree(adapters[minor].buffer);
+	adapters[minor].buffer = NULL;
+
 	module_put(THIS_MODULE);
 
 	return (SUCCESS);
@@ -222,20 +225,83 @@ static int device_release(struct inode *inode, struct file *file)
  */
 static ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_t * offset)
 {
-
+	size_t i;
 	unsigned minor;
 
-	minor = iminor(filp->f_inode);
+	((void) offset);
 
-	return (0);
+	minor = iminor(filp->f_inode);
+	if (minor >= nr_endpoints)
+		return (-EINVAL);
+
+	/* Read bytes. */
+	for (i = 0; i < length; /* noop*/)
+	{
+		size_t n;
+		uint32_t word;
+		size_t count;
+
+		/* Wait for data, */
+		if (adapters[minor].head == adapters[minor].tail)
+		{
+			wait_event_interruptible(adapters[minor].wqueue, adapters[minor].data_received);
+			adapters[minor].data_received = !adapters[minor].data_received;
+		}
+
+		word = adapters[minor].buffer[adapters[minor].head];
+		adapters[minor].head = (adapters[minor].head + 1)%OPTIMSOC_NA_BUFFER_SIZE;
+
+		n = ((i + 4) <= length) ? 4 : (length  - i);
+
+		count = copy_to_user(&buffer[i], &word, n);
+
+		if (count != 0)
+			return (i);
+
+		i += 4;
+	}
+
+	return (length);
 }
 
 /*
- * Writes butes from the NoC device.
+ * Writes bytes from the NoC device.
  */
 static ssize_t device_write(struct file *filp, const char *buff, size_t len, loff_t * off)
 {
-	return (-EINVAL);
+	int i;
+	unsigned minor;
+
+	((void) off);
+
+	/* Get minor device. */
+	minor = iminor(filp->f_inode);
+	if (minor >= nr_endpoints)
+		return (-EINVAL);
+
+	printk(KERN_INFO "%s: write to device %d", OPTIMSOC_NA_NAME, minor);
+
+	/* Send words of data. */
+	for (i = 0; i < len; /* noop. */)
+	{
+		size_t n;
+		size_t count;
+		uint32_t word;
+
+		n = ((i + 4) <= len) ? 4 : (len  - i);
+
+		word = 0;
+		count = copy_from_user(&word, &buff[i], n);
+
+		if (count != 0)
+			return (i);
+
+		send(minor, word);
+
+		i += 4;
+	}
+
+	return (len);
 }
 
 static struct file_operations fops = {
@@ -255,6 +321,8 @@ static int __init optimsoc_module_init(void)
 	int ret;
 	const unsigned long flags = IRQF_SHARED | IRQF_TRIGGER_HIGH;
 
+	printk(KERN_INFO "%s: loading driver", OPTIMSOC_NA_NAME);
+
 	/* Register interrupt device driver. */
 	major = register_chrdev(0, OPTIMSOC_NA_NAME, &fops);
 	if (major < 0)
@@ -272,13 +340,19 @@ static int __init optimsoc_module_init(void)
 
 	OPTIMSOC_NA_BASE_VADDR = (uint32_t) ioremap_nocache(OPTIMSOC_NA_BASE_HWADDR, OPTIMSOC_NA_MEM_SIZE);
 
-    _num_endpoints = (uint32_t)(REG_NUMEP);
+    nr_endpoints = REG32(REG_NUMEP);
+
+	printk(KERN_INFO "%s: %d endpoints detected", OPTIMSOC_NA_NAME, nr_endpoints);
 
 	/* Initialize devices. */
 	for (i = 0; i < NR_ENDPOINTS; i++)
 	{
 		adapters[i].nopen = 0;
+		adapters[i].data_received = 0;
+		adapters[i].head = 0;
+		adapters[i].tail = 0;
 		adapters[i].buffer = NULL;
+		init_waitqueue_head(&adapters[i].wqueue);
 	}
 
 	return (SUCCESS);
@@ -295,6 +369,17 @@ error0:
  */
 static void __exit optimsoc_module_cleanup(void)
 {
+	int i;
+
+	printk(KERN_INFO "%s: unloading driver", OPTIMSOC_NA_NAME);
+
+	/* Release resources. */
+	for (i = 0; i < NR_ENDPOINTS; i++)
+	{
+		if (adapters[i].buffer != NULL)
+			kfree(adapters[i].buffer);
+	}
+	
 	unregister_chrdev(major, OPTIMSOC_NA_NAME);
 }
 
