@@ -147,28 +147,41 @@ static irqreturn_t irq_handler(int irq, void *opaque)
 
 	((void) opaque);
 
+	/*
+	 * FIXME: Potential race condition bellow.
+	 */
 	for (i = 0; i < nr_endpoints; i++)
 	{
-		uint32_t word;
+		int j;
+		uint32_t size;
 
-		/*
-		 * FIXME: Potential race condition bellow.
-		 */
 		if (adapters[i].nopen <= 0)
 			continue;
 
-		word = receive(i);
+		size = receive(i);
 
-		/* Drop packet. */
-		if ((adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE == adapters[i].head)
-			continue;
-		
-		adapters[i].buffer[adapters[i].tail] = word;
+		for (j = 0; j < size; j += 4)
+		{
+			uint32_t word;
 
-		adapters[i].tail = (adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE;
+			word = receive(i);
 
-		adapters[i].data_received = 1;
-		wake_up(adapters[i].wqueue);
+			/* Drop packet. */
+			if ((adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE == adapters[i].head)
+				break;
+
+			adapters[i].buffer[adapters[i].tail] = word;
+
+			adapters[i].tail = (adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE;
+
+			adapters[i].data_received = 1;
+		}
+
+		printk(KERN_INFO "tile %d read %d bytes", i, size);
+
+		/* Wakeup sleeping processes. */
+		if (adapters[i].data_received)
+			wake_up(&adapters[i].wqueue);
 	}
 
 	return (IRQ_HANDLED);
@@ -271,6 +284,7 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 {
 	int i;
 	unsigned minor;
+	uint32_t *words;
 
 	((void) off);
 
@@ -279,9 +293,13 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 	if (minor >= nr_endpoints)
 		return (-EINVAL);
 
+    words = kmalloc(OPTIMSOC_NA_BUFFER_SIZE, GFP_KERNEL);
+	if (words == NULL)
+		return (-ENOMEM);
+
 	printk(KERN_INFO "%s: write to device %d", OPTIMSOC_NA_NAME, minor);
 
-	/* Send words of data. */
+	/* Copy data to temporary buffer. */
 	for (i = 0; i < len; /* noop. */)
 	{
 		size_t n;
@@ -294,12 +312,29 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 		count = copy_from_user(&word, &buff[i], n);
 
 		if (count != 0)
-			return (i);
-
-		send(minor, word);
+		{
+			len = i;
+			break;
+		}
 
 		i += 4;
 	}
+	
+	/* Send words. */
+	send(minor, len);
+	for (i = 0; i < len; i += 4)
+	{
+		size_t n;
+		uint32_t word;
+
+		n = ((i + 4) <= len) ? 4 : (len  - i);
+
+		word = 0;
+		memcpy((char *) &word, (char *) &words[i], n);
+		send(minor, word);
+	}
+
+	kfree(words);
 
 	return (len);
 }
