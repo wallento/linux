@@ -47,7 +47,7 @@
 /*
  * NoC adapter IRQ number.
  */
-#define OPTIMSOC_NA_IRQ 5
+#define OPTIMSOC_NA_IRQ 3
 
 /*
  * Base hardware address for NoC adapter.
@@ -120,6 +120,7 @@ static void send(unsigned ep, uint32_t word)
 {
 	uint32_t *addr;
 
+	printk(KERN_INFO "send: %x", word);
 	addr = (uint32_t *)(EP_BASE + ep*EP_OFFSET + REG_SEND);
 
 	*addr = word;
@@ -152,32 +153,22 @@ static irqreturn_t irq_handler(int irq, void *opaque)
 	 */
 	for (i = 0; i < nr_endpoints; i++)
 	{
-		int j;
-		uint32_t size;
+		uint32_t word;
 
 		if (adapters[i].nopen <= 0)
 			continue;
 
-		size = receive(i);
+		word = receive(i);
 
-		for (j = 0; j < size; j += 4)
-		{
-			uint32_t word;
+		/* Drop packet. */
+		if ((adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE == adapters[i].head)
+			break;
 
-			word = receive(i);
+		adapters[i].buffer[adapters[i].tail] = word;
 
-			/* Drop packet. */
-			if ((adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE == adapters[i].head)
-				break;
+		adapters[i].tail = (adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE;
 
-			adapters[i].buffer[adapters[i].tail] = word;
-
-			adapters[i].tail = (adapters[i].tail + 1)%OPTIMSOC_NA_BUFFER_SIZE;
-
-			adapters[i].data_received = 1;
-		}
-
-		printk(KERN_INFO "tile %d read %d bytes", i, size);
+		adapters[i].data_received = 1;
 
 		/* Wakeup sleeping processes. */
 		if (adapters[i].data_received)
@@ -223,6 +214,8 @@ static int device_release(struct inode *inode, struct file *file)
 
 	minor = iminor(inode);
 
+	printk(KERN_INFO "%s: close device %d", OPTIMSOC_NA_NAME, minor);
+
 	/* Release resources. */
 	adapters[minor].nopen--;
 	kfree(adapters[minor].buffer);
@@ -247,6 +240,8 @@ static ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_
 	if (minor >= nr_endpoints)
 		return (-EINVAL);
 
+	printk(KERN_INFO "%s: read from device %d", OPTIMSOC_NA_NAME, minor);
+
 	/* Read bytes. */
 	for (i = 0; i < length; /* noop*/)
 	{
@@ -268,8 +263,10 @@ static ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_
 
 		count = copy_to_user(&buffer[i], &word, n);
 
+		printk(KERN_INFO "receive: %x", word);
+
 		if (count != 0)
-			return (i);
+			return (i + (n - count));
 
 		i += 4;
 	}
@@ -284,7 +281,6 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 {
 	int i;
 	unsigned minor;
-	uint32_t *words;
 
 	((void) off);
 
@@ -292,10 +288,6 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 	minor = iminor(filp->f_inode);
 	if (minor >= nr_endpoints)
 		return (-EINVAL);
-
-    words = kmalloc(OPTIMSOC_NA_BUFFER_SIZE, GFP_KERNEL);
-	if (words == NULL)
-		return (-ENOMEM);
 
 	printk(KERN_INFO "%s: write to device %d", OPTIMSOC_NA_NAME, minor);
 
@@ -308,33 +300,14 @@ static ssize_t device_write(struct file *filp, const char *buff, size_t len, lof
 
 		n = ((i + 4) <= len) ? 4 : (len  - i);
 
-		word = 0;
 		count = copy_from_user(&word, &buff[i], n);
+		send(minor, word);
 
 		if (count != 0)
-		{
-			len = i;
-			break;
-		}
+			return (i + (n - count));
 
 		i += 4;
 	}
-	
-	/* Send words. */
-	send(minor, len);
-	for (i = 0; i < len; i += 4)
-	{
-		size_t n;
-		uint32_t word;
-
-		n = ((i + 4) <= len) ? 4 : (len  - i);
-
-		word = 0;
-		memcpy((char *) &word, (char *) &words[i], n);
-		send(minor, word);
-	}
-
-	kfree(words);
 
 	return (len);
 }
