@@ -20,7 +20,7 @@
 		cpu@0 {
 			compatible = "opencores,or1200-rtlsvn481";
 			reg = <0>;
-			clock-frequency = <20000000>;
+			clock-frequency = <50000000>;
 		};
 	};
 
@@ -36,15 +36,15 @@
 	};
 
 	serial0: serial@90000000 {
-		compatible = "opencores,uart16550-rtlsvn105", "ns16550a";
+		compatible = "opencores,uart16550-rtlsvn105", "ns16550";
 		reg = <0x90000000 0x100>;
 		interrupts = <2>;
-		clock-frequency = <20000000>;
+		clock-frequency = <50000000>;
 	};
 
-       enet0: ethoc@92000000 {
-               compatible = "opencores,ethmac-rtlsvn338";
-               reg = <0x92000000 0x100>;
-               interrupts = <4>;
+	optimsoc: optimsoc@e0100000 {
+		compatible = "opencores";
+		reg = <0xe0100000 0x1000>;
+		interrupts = <3>;
 	};
 };
